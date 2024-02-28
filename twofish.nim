@@ -182,9 +182,9 @@ proc twofishEncrypt*(c: TwoFishCtx, src: openArray[byte], dst: var openArray[byt
 
   # NOTE: load input
   var
-    ia = load32l(src[0  ..<  4])
-    ib = load32l(src[4  ..<  8])
-    ic = load32l(src[8  ..< 12])
+    ia = load32l(src[ 0 ..<  4])
+    ib = load32l(src[ 4 ..<  8])
+    ic = load32l(src[ 8 ..< 12])
     id = load32l(src[12 ..< 16])
 
   # NOTE: pre-whitening
