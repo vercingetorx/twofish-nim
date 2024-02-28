@@ -197,12 +197,12 @@ proc twofishEncrypt*(c: TwoFishCtx, src: openArray[byte], dst: var openArray[byt
   var t2: uint32
   for i in 0 ..< 8:
     let k = c.k[8+i*4 ..< 12+i*4]
-    t2 = S2[byte(ib)] xor S3[byte(ib shr 8)] xor S4[byte(ib shr 16)] xor S1[byte(ib shr 24)]
+    t2 =  S2[byte(ib)] xor S3[byte(ib shr 8)] xor S4[byte(ib shr 16)] xor S1[byte(ib shr 24)]
     t1 = (S1[byte(ia)] xor S2[byte(ia shr 8)] xor S3[byte(ia shr 16)] xor S4[byte(ia shr 24)]) + t2
     ic = rotateRightBits(ic xor (t1 + k[0]), 1)
     id = rotateLeftBits(id, 1) xor (t2 + t1 + k[1])
 
-    t2 = S2[byte(id)] xor S3[byte(id shr 8)] xor S4[byte(id shr 16)] xor S1[byte(id shr 24)]
+    t2 =  S2[byte(id)] xor S3[byte(id shr 8)] xor S4[byte(id shr 16)] xor S1[byte(id shr 24)]
     t1 = (S1[byte(ic)] xor S2[byte(ic shr 8)] xor S3[byte(ic shr 16)] xor S4[byte(ic shr 24)]) + t2
     ia = rotateRightBits(ia xor (t1 + k[2]), 1)
     ib = rotateLeftBits(ib, 1) xor (t2 + t1 + k[3])
