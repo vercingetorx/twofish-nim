@@ -1,2 +1,1 @@
-# twofish-nim
-twofish in pure nim
+AES in Pure Nim. Currently the base modes ECB, CBC, CTR are implemented.
