@@ -193,8 +193,7 @@ proc twofishEncrypt*(c: TwoFishCtx, src: openArray[byte], dst: var openArray[byt
   ic = ic xor c.k[2]
   id = id xor c.k[3]
 
-  var t1: uint32
-  var t2: uint32
+  var t1, t2: uint32
   for i in 0 ..< 8:
     let k = c.k[8+i*4 ..< 12+i*4]
     t2 =  S2[byte(ib)] xor S3[byte(ib shr 8)] xor S4[byte(ib shr 16)] xor S1[byte(ib shr 24)]
@@ -241,8 +240,7 @@ proc twofishDecrypt*(c: TwoFishCtx, src: openArray[byte], dst: var openArray[byt
     ic = ta xor c.k[4]
     id = tb xor c.k[5]
 
-  var t1: uint32
-  var t2: uint32
+  var t1, t2: uint32
   for i in countdown(8, 1, 1):
     let k = c.k[4+i*4 ..< 8+i*4]
     t2 =  S2[byte(id)] xor S3[byte(id shr 8)] xor S4[byte(id shr 16)] xor S1[byte(id shr 24)]
