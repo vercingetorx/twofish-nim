@@ -1,319 +1,1115 @@
-import std/bitops
+import std/[sequtils, strutils, base64]
+import ./galois
 
-# NOTE: ported to Nim from https://cs.opensource.google/go/x/crypto/+/master:twofish/twofish.go
+# Usage notes
+# - Contexts are stateful across calls:
+#   - CBC: Keeps the previous ciphertext block. If you call encrypt/decrypt
+#     multiple times on the same TwofishCbcCtx, blocks chain across calls.
+#     To process independent messages, create a fresh ctx with newTwofishCbcCtx.
+#   - CTR: Maintains a 128-bit counter (nonce[0..7] || state[0..7]) and
+#     increments the low 8 bytes for each block. The counter continues across
+#     calls. To process an independent message with the same ctx, either
+#     call initCounter() to reset it to nonce||initState or create a new ctx
+#     with newTwofishCtrCtx.
 
-const BlockSize = 16
-const mdsPolynomial: uint8 = 0x169  # x xor 8 + x xor 6 + x xor 5 + x xor 3 + 1, see [TWOFISH] 4.2
-const rsPolynomial:  uint8 = 0x14d  # x xor 8 + x xor 6 + x xor 3 + x xor 2 + 1, see [TWOFISH] 4.3
+# Twofish core expects the cipher state type to be declared before inclusion.
+type
+  TwoFishCtx = object
+    s: array[4, array[256, uint32]]
+    k: array[40, uint32]
 
-type KeySizeError = object of ValueError
+include twofish_core
+const twofishSbox* = sbox
+#[
+  key sizes (int bytes -> bits):
+    16 -> 128bit
+    24 -> 192bit
+    32 -> 256bit
+]#
 
-# NOTE: the RS matrix. See [TWOFISH] 4.3
-const rs: array[4, array[8, byte]] = [
-  [0x01'u8, 0xA4'u8, 0x55'u8, 0x87'u8, 0x5A'u8, 0x58'u8, 0xDB'u8, 0x9E'u8],
-  [0xA4'u8, 0x56'u8, 0x82'u8, 0xF3'u8, 0x1E'u8, 0xC6'u8, 0x68'u8, 0xE5'u8],
-  [0x02'u8, 0xA1'u8, 0xFC'u8, 0xC1'u8, 0x47'u8, 0xAE'u8, 0x3D'u8, 0x19'u8],
-  [0xA4'u8, 0x55'u8, 0x87'u8, 0x5A'u8, 0x58'u8, 0xDB'u8, 0x9E'u8, 0x03'u8]
-]
+const blocksize = 16
 
-# NOTE: sbox tables
-const sbox: array[2, array[256, byte]] = [
-  [
-    0xa9'u8, 0x67'u8, 0xb3'u8, 0xe8'u8, 0x04'u8, 0xfd'u8, 0xa3'u8, 0x76'u8, 
-    0x9a'u8, 0x92'u8, 0x80'u8, 0x78'u8, 0xe4'u8, 0xdd'u8, 0xd1'u8, 0x38'u8, 
-    0x0d'u8, 0xc6'u8, 0x35'u8, 0x98'u8, 0x18'u8, 0xf7'u8, 0xec'u8, 0x6c'u8, 
-    0x43'u8, 0x75'u8, 0x37'u8, 0x26'u8, 0xfa'u8, 0x13'u8, 0x94'u8, 0x48'u8, 
-    0xf2'u8, 0xd0'u8, 0x8b'u8, 0x30'u8, 0x84'u8, 0x54'u8, 0xdf'u8, 0x23'u8, 
-    0x19'u8, 0x5b'u8, 0x3d'u8, 0x59'u8, 0xf3'u8, 0xae'u8, 0xa2'u8, 0x82'u8, 
-    0x63'u8, 0x01'u8, 0x83'u8, 0x2e'u8, 0xd9'u8, 0x51'u8, 0x9b'u8, 0x7c'u8, 
-    0xa6'u8, 0xeb'u8, 0xa5'u8, 0xbe'u8, 0x16'u8, 0x0c'u8, 0xe3'u8, 0x61'u8, 
-    0xc0'u8, 0x8c'u8, 0x3a'u8, 0xf5'u8, 0x73'u8, 0x2c'u8, 0x25'u8, 0x0b'u8, 
-    0xbb'u8, 0x4e'u8, 0x89'u8, 0x6b'u8, 0x53'u8, 0x6a'u8, 0xb4'u8, 0xf1'u8, 
-    0xe1'u8, 0xe6'u8, 0xbd'u8, 0x45'u8, 0xe2'u8, 0xf4'u8, 0xb6'u8, 0x66'u8, 
-    0xcc'u8, 0x95'u8, 0x03'u8, 0x56'u8, 0xd4'u8, 0x1c'u8, 0x1e'u8, 0xd7'u8, 
-    0xfb'u8, 0xc3'u8, 0x8e'u8, 0xb5'u8, 0xe9'u8, 0xcf'u8, 0xbf'u8, 0xba'u8, 
-    0xea'u8, 0x77'u8, 0x39'u8, 0xaf'u8, 0x33'u8, 0xc9'u8, 0x62'u8, 0x71'u8, 
-    0x81'u8, 0x79'u8, 0x09'u8, 0xad'u8, 0x24'u8, 0xcd'u8, 0xf9'u8, 0xd8'u8, 
-    0xe5'u8, 0xc5'u8, 0xb9'u8, 0x4d'u8, 0x44'u8, 0x08'u8, 0x86'u8, 0xe7'u8, 
-    0xa1'u8, 0x1d'u8, 0xaa'u8, 0xed'u8, 0x06'u8, 0x70'u8, 0xb2'u8, 0xd2'u8, 
-    0x41'u8, 0x7b'u8, 0xa0'u8, 0x11'u8, 0x31'u8, 0xc2'u8, 0x27'u8, 0x90'u8, 
-    0x20'u8, 0xf6'u8, 0x60'u8, 0xff'u8, 0x96'u8, 0x5c'u8, 0xb1'u8, 0xab'u8, 
-    0x9e'u8, 0x9c'u8, 0x52'u8, 0x1b'u8, 0x5f'u8, 0x93'u8, 0x0a'u8, 0xef'u8, 
-    0x91'u8, 0x85'u8, 0x49'u8, 0xee'u8, 0x2d'u8, 0x4f'u8, 0x8f'u8, 0x3b'u8, 
-    0x47'u8, 0x87'u8, 0x6d'u8, 0x46'u8, 0xd6'u8, 0x3e'u8, 0x69'u8, 0x64'u8, 
-    0x2a'u8, 0xce'u8, 0xcb'u8, 0x2f'u8, 0xfc'u8, 0x97'u8, 0x05'u8, 0x7a'u8, 
-    0xac'u8, 0x7f'u8, 0xd5'u8, 0x1a'u8, 0x4b'u8, 0x0e'u8, 0xa7'u8, 0x5a'u8, 
-    0x28'u8, 0x14'u8, 0x3f'u8, 0x29'u8, 0x88'u8, 0x3c'u8, 0x4c'u8, 0x02'u8, 
-    0xb8'u8, 0xda'u8, 0xb0'u8, 0x17'u8, 0x55'u8, 0x1f'u8, 0x8a'u8, 0x7d'u8, 
-    0x57'u8, 0xc7'u8, 0x8d'u8, 0x74'u8, 0xb7'u8, 0xc4'u8, 0x9f'u8, 0x72'u8, 
-    0x7e'u8, 0x15'u8, 0x22'u8, 0x12'u8, 0x58'u8, 0x07'u8, 0x99'u8, 0x34'u8, 
-    0x6e'u8, 0x50'u8, 0xde'u8, 0x68'u8, 0x65'u8, 0xbc'u8, 0xdb'u8, 0xf8'u8, 
-    0xc8'u8, 0xa8'u8, 0x2b'u8, 0x40'u8, 0xdc'u8, 0xfe'u8, 0x32'u8, 0xa4'u8, 
-    0xca'u8, 0x10'u8, 0x21'u8, 0xf0'u8, 0xd3'u8, 0x5d'u8, 0x0f'u8, 0x00'u8, 
-    0x6f'u8, 0x9d'u8, 0x36'u8, 0x42'u8, 0x4a'u8, 0x5e'u8, 0xc1'u8, 0xe0'u8
-  ],
-  [
-    0x75'u8, 0xf3'u8, 0xc6'u8, 0xf4'u8, 0xdb'u8, 0x7b'u8, 0xfb'u8, 0xc8'u8, 
-    0x4a'u8, 0xd3'u8, 0xe6'u8, 0x6b'u8, 0x45'u8, 0x7d'u8, 0xe8'u8, 0x4b'u8, 
-    0xd6'u8, 0x32'u8, 0xd8'u8, 0xfd'u8, 0x37'u8, 0x71'u8, 0xf1'u8, 0xe1'u8, 
-    0x30'u8, 0x0f'u8, 0xf8'u8, 0x1b'u8, 0x87'u8, 0xfa'u8, 0x06'u8, 0x3f'u8, 
-    0x5e'u8, 0xba'u8, 0xae'u8, 0x5b'u8, 0x8a'u8, 0x00'u8, 0xbc'u8, 0x9d'u8, 
-    0x6d'u8, 0xc1'u8, 0xb1'u8, 0x0e'u8, 0x80'u8, 0x5d'u8, 0xd2'u8, 0xd5'u8, 
-    0xa0'u8, 0x84'u8, 0x07'u8, 0x14'u8, 0xb5'u8, 0x90'u8, 0x2c'u8, 0xa3'u8, 
-    0xb2'u8, 0x73'u8, 0x4c'u8, 0x54'u8, 0x92'u8, 0x74'u8, 0x36'u8, 0x51'u8, 
-    0x38'u8, 0xb0'u8, 0xbd'u8, 0x5a'u8, 0xfc'u8, 0x60'u8, 0x62'u8, 0x96'u8, 
-    0x6c'u8, 0x42'u8, 0xf7'u8, 0x10'u8, 0x7c'u8, 0x28'u8, 0x27'u8, 0x8c'u8, 
-    0x13'u8, 0x95'u8, 0x9c'u8, 0xc7'u8, 0x24'u8, 0x46'u8, 0x3b'u8, 0x70'u8, 
-    0xca'u8, 0xe3'u8, 0x85'u8, 0xcb'u8, 0x11'u8, 0xd0'u8, 0x93'u8, 0xb8'u8, 
-    0xa6'u8, 0x83'u8, 0x20'u8, 0xff'u8, 0x9f'u8, 0x77'u8, 0xc3'u8, 0xcc'u8, 
-    0x03'u8, 0x6f'u8, 0x08'u8, 0xbf'u8, 0x40'u8, 0xe7'u8, 0x2b'u8, 0xe2'u8, 
-    0x79'u8, 0x0c'u8, 0xaa'u8, 0x82'u8, 0x41'u8, 0x3a'u8, 0xea'u8, 0xb9'u8, 
-    0xe4'u8, 0x9a'u8, 0xa4'u8, 0x97'u8, 0x7e'u8, 0xda'u8, 0x7a'u8, 0x17'u8, 
-    0x66'u8, 0x94'u8, 0xa1'u8, 0x1d'u8, 0x3d'u8, 0xf0'u8, 0xde'u8, 0xb3'u8, 
-    0x0b'u8, 0x72'u8, 0xa7'u8, 0x1c'u8, 0xef'u8, 0xd1'u8, 0x53'u8, 0x3e'u8, 
-    0x8f'u8, 0x33'u8, 0x26'u8, 0x5f'u8, 0xec'u8, 0x76'u8, 0x2a'u8, 0x49'u8, 
-    0x81'u8, 0x88'u8, 0xee'u8, 0x21'u8, 0xc4'u8, 0x1a'u8, 0xeb'u8, 0xd9'u8, 
-    0xc5'u8, 0x39'u8, 0x99'u8, 0xcd'u8, 0xad'u8, 0x31'u8, 0x8b'u8, 0x01'u8, 
-    0x18'u8, 0x23'u8, 0xdd'u8, 0x1f'u8, 0x4e'u8, 0x2d'u8, 0xf9'u8, 0x48'u8, 
-    0x4f'u8, 0xf2'u8, 0x65'u8, 0x8e'u8, 0x78'u8, 0x5c'u8, 0x58'u8, 0x19'u8, 
-    0x8d'u8, 0xe5'u8, 0x98'u8, 0x57'u8, 0x67'u8, 0x7f'u8, 0x05'u8, 0x64'u8, 
-    0xaf'u8, 0x63'u8, 0xb6'u8, 0xfe'u8, 0xf5'u8, 0xb7'u8, 0x3c'u8, 0xa5'u8, 
-    0xce'u8, 0xe9'u8, 0x68'u8, 0x44'u8, 0xe0'u8, 0x4d'u8, 0x43'u8, 0x69'u8, 
-    0x29'u8, 0x2e'u8, 0xac'u8, 0x15'u8, 0x59'u8, 0xa8'u8, 0x0a'u8, 0x9e'u8, 
-    0x6e'u8, 0x47'u8, 0xdf'u8, 0x34'u8, 0x35'u8, 0x6a'u8, 0xcf'u8, 0xdc'u8, 
-    0x22'u8, 0xc9'u8, 0xc0'u8, 0x9b'u8, 0x89'u8, 0xd4'u8, 0xed'u8, 0xab'u8, 
-    0x12'u8, 0xa2'u8, 0x0d'u8, 0x52'u8, 0xbb'u8, 0x02'u8, 0x2f'u8, 0xa9'u8, 
-    0xd7'u8, 0x61'u8, 0x1e'u8, 0xb4'u8, 0x50'u8, 0x04'u8, 0xf6'u8, 0xc2'u8, 
-    0x16'u8, 0x25'u8, 0x86'u8, 0x56'u8, 0x55'u8, 0x09'u8, 0xbe'u8, 0x91'u8
-  ]
-]
-
-###################################################################################
-
-proc store32l(dst: var openArray[byte], index: int, src: uint32) =
-  dst[index + 0] = byte(src)
-  dst[index + 1] = byte(src shr  8)
-  dst[index + 2] = byte(src shr 16)
-  dst[index + 3] = byte(src shr 24)
+type
+  TwofishEcbCtx* = object # Electronic CodeBook
+    key:            seq[byte]
+    state:          TwoFishCtx
+  TwofishCbcCtx* = object # Ciphertext Block Chaining
+    key:            seq[byte]
+    iv:             seq[byte]
+    state:          TwoFishCtx
+    previousBlock:  array[blocksize, byte]
+    isEncryptState: bool
+  TwofishCtrCtx* = object # Counter
+    key:            seq[byte]
+    nonce:          seq[byte]
+    state:          TwoFishCtx
+    initState:      array[8, byte]
+    counter:        array[blocksize, byte]
+    isEncryptState: bool
+  TwofishGcmCtx* = object # Galois/Counter Mode (AEAD)
+    key:   seq[byte]
+    iv:    seq[byte]
+    state: TwoFishCtx
+    H:     Block128           # E_K(0^128)
+    J0:    Block128           # pre-counter block
+  TwofishGcmSivCtx* = object # GCM-SIV (AEAD, per-nonce key derivation)
+    key:   seq[byte]          # key-generating key (16 or 32 bytes)
+    nonce: seq[byte]          # 12 bytes
+  TwofishXtsCtx* = object # XTS mode (IEEE P1619)
+    key1:  seq[byte]          # 16 or 32 bytes
+    key2:  seq[byte]          # 16 or 32 bytes
+    st1:   TwoFishCtx         # data encryption key
+    st2:   TwoFishCtx         # tweak encryption key
 
 
-proc load32l(src: openArray[byte]): uint32 =
-  result = uint32(src[0])        or
-           uint32(src[1]) shl  8 or
-           uint32(src[2]) shl 16 or
-           uint32(src[3]) shl 24
+#################################################################################
 
-###################################################################################
-
-proc gfMult(a, b: byte, p: uint32): byte =
-  ## returns a·b in GF(2^8)/p
-  var B: array[2, uint32] = [0'u32, uint32(b)]
-  let P: array[2, uint32] = [0'u32, p]
+proc encodeBytes(s: string): seq[byte] =
+  ## encode ascii string to bytes
+  result = newSeq[byte](s.len)
+  for i, c in s:
+    result[i] = byte(c)
   
-  var temp: uint32
-  var aa = a
-
-  # NOTE: branchless GF multiplier
-  for i in 0 ..< 7:
-    temp = temp xor B[aa and 1]
-    aa = aa shr 1
-    B[1] = P[B[1] shr 7] xor (B[1] shl 1)
-
-  temp = temp xor B[aa and 1]
-  return byte(temp)
+  return result
 
 
-proc mdsColumnMult(input: byte, col: int): uint32 =
-  ## calculates y[col] where [y0 y1 y2 y3] = MDS · [x0]
-  let
-    mul01 = input
-    mul5B = gfMult(input, 0x5B'u8, mdsPolynomial)
-    mulEF = gfMult(input, 0xEF'u8, mdsPolynomial)
-
-  case col
-  of 0:
-    return uint32(mul01) or (uint32(mul5B) shl 8) or (uint32(mulEF) shl 16) or (uint32(mulEF) shl 24)
-  of 1:
-    return uint32(mulEF) or (uint32(mulEF) shl 8) or (uint32(mul5B) shl 16) or (uint32(mul01) shl 24)
-  of 2:
-    return uint32(mul5B) or (uint32(mulEF) shl 8) or (uint32(mul01) shl 16) or (uint32(mulEF) shl 24)
-  of 3:
-    return uint32(mul5B) or (uint32(mul01) shl 8) or (uint32(mulEF) shl 16) or (uint32(mul5B) shl 24)
-  else:
-    raise newException(ValueError, "Invalid column index")
-
-
-proc h(input, key: openArray[byte], offset: int): uint32 =
-  ## implements the S-box generation function. See [TWOFISH] 4.3.5
-  var y: array[4, byte]
-  for x in 0 ..< y.len:
-    y[x] = input[x]
-
-  let keyLenDiv8 = key.len div 8
-  if keyLenDiv8 == 4:
-    y[0] = sbox[1][y[0]] xor key[4*(6+offset)+0]
-    y[1] = sbox[0][y[1]] xor key[4*(6+offset)+1]
-    y[2] = sbox[0][y[2]] xor key[4*(6+offset)+2]
-    y[3] = sbox[1][y[3]] xor key[4*(6+offset)+3]
-  if keyLenDiv8 >= 3:
-    y[0] = sbox[1][y[0]] xor key[4*(4+offset)+0]
-    y[1] = sbox[1][y[1]] xor key[4*(4+offset)+1]
-    y[2] = sbox[0][y[2]] xor key[4*(4+offset)+2]
-    y[3] = sbox[0][y[3]] xor key[4*(4+offset)+3]
-  if keyLenDiv8 >= 2:
-    y[0] = sbox[1][sbox[0][sbox[0][y[0]] xor key[4*(2+offset)+0]] xor key[4*(0+offset)+0]]
-    y[1] = sbox[0][sbox[0][sbox[1][y[1]] xor key[4*(2+offset)+1]] xor key[4*(0+offset)+1]]
-    y[2] = sbox[1][sbox[1][sbox[0][y[2]] xor key[4*(2+offset)+2]] xor key[4*(0+offset)+2]]
-    y[3] = sbox[0][sbox[1][sbox[1][y[3]] xor key[4*(2+offset)+3]] xor key[4*(0+offset)+3]]
+proc decodeBytes(bs: openArray[byte]): string =
+  ## decode bytes to ascii string
+  result = newStringOfCap(bs.len)
+  for i, b in bs:
+    result.add(char(b))
   
-  # NOTE: [y0 y1 y2 y3] = MDS . [x0 x1 x2 x3]
-  var mdsMult: uint32
-  for i in 0 ..< y.len:
-    mdsMult = mdsMult xor mdsColumnMult(y[i], i)
-  return mdsMult
+  return result
+
+proc fromHex*(h: string): seq[byte] =
+  ## parse lowercase/uppercase hex string to bytes
+  if h.len mod 2 != 0:
+    raise newException(ValueError, "hex string must have even length")
+  result = newSeq[byte](h.len div 2)
+  for i in 0 ..< result.len:
+    let a = h[2*i]
+    let b = h[2*i+1]
+    proc val(c: char): int =
+      if c >= '0' and c <= '9': int(c) - int('0')
+      elif c >= 'a' and c <= 'f': 10 + int(c) - int('a')
+      elif c >= 'A' and c <= 'F': 10 + int(c) - int('A')
+      else: raise newException(ValueError, "invalid hex char: " & $c)
+    result[i] = byte((val(a) shl 4) or val(b))
 
 
-proc twofishEncrypt*(c: TwoFishCtx, src: openArray[byte], dst: var openArray[byte]) =
-  let
-    S1 = c.s[0]
-    S2 = c.s[1]
-    S3 = c.s[2]
-    S4 = c.s[3]
+proc padPKCS7*(data: openArray[byte]): seq[byte] =
+  let paddingLen = 16 - (len(data) mod 16)
+  let paddingByte = paddingLen.byte
+  result = newSeqOfCap[byte](len(data) + paddingLen)
+  result.add(data)
+  for _ in 1 .. paddingLen:
+    result.add(paddingByte)
 
-  # NOTE: load input
-  var
-    ia = load32l(src[ 0 ..<  4])
-    ib = load32l(src[ 4 ..<  8])
-    ic = load32l(src[ 8 ..< 12])
-    id = load32l(src[12 ..< 16])
 
-  # NOTE: pre-whitening
-  ia = ia xor c.k[0]
-  ib = ib xor c.k[1]
-  ic = ic xor c.k[2]
-  id = id xor c.k[3]
+proc unpadPKCS7*(data: openArray[byte]): seq[byte] =
+  if data.len == 0 or data.len mod 16 != 0:
+    raise newException(ValueError, "Invalid padded data length")
+  
+  let paddingLen = data[^1].int
+  if paddingLen < 1 or paddingLen > 16:
+    raise newException(ValueError, "Invalid padding length")
+  
+  for i in 1 .. paddingLen:
+    if data[data.len - i] != paddingLen.byte:
+      raise newException(ValueError, "Invalid padding")
+  result = data[0 ..< data.len - paddingLen]
 
-  var t1, t2: uint32
+
+proc xorBlocks(this: var openArray[byte], that: openArray[byte]) =
+  for i in 0 ..< this.len:
+    this[i] = this[i] xor that[i]
+
+
+proc xorBlocks(this: openArray[byte], that: openArray[byte]): array[blocksize, byte] =
+  for i in 0 ..< this.len:
+    result[i] = this[i] xor that[i]
+
+
+proc xorBlocksSeq(this: openArray[byte], that: openArray[byte]): seq[byte] =
+  result = newSeq[byte](this.len)
+  for i in 0 ..< this.len:
+    result[i] = this[i] xor that[i]
+
+
+proc initPreviousBlock(ctx: var TwofishCbcCtx) =
+  ## initialize previous block with IV
+  for i, b in ctx.iv:
+    ctx.previousBlock[i] = b
+
+
+proc initCounter*(ctx: var TwofishCtrCtx) =
+  ## initialize counter with IV
+  for i, b in ctx.nonce:
+    ctx.counter[i] = b
+  for i, b in ctx.initState:
+    ctx.counter[8 + i] = b
+
+
+proc incrementCounter(ctx: var TwofishCtrCtx) =
+  for i in countdown(15, 8):
+    ctx.counter[i] = ctx.counter[i] + 1
+    if ctx.counter[i] != 0:  # No overflow for this byte
+      return
+  raise newException(OverflowDefect, "counter overflow")
+
+
+proc intToBytesBE(n: uint64): array[8, byte] =
+  ## big endian
   for i in 0 ..< 8:
-    let k = c.k[8+i*4 ..< 12+i*4]
-    t2 =  S2[byte(ib)] xor S3[byte(ib shr 8)] xor S4[byte(ib shr 16)] xor S1[byte(ib shr 24)]
-    t1 = (S1[byte(ia)] xor S2[byte(ia shr 8)] xor S3[byte(ia shr 16)] xor S4[byte(ia shr 24)]) + t2
-    ic = rotateRightBits(ic xor (t1 + k[0]), 1)
-    id = rotateLeftBits(id, 1) xor (t2 + t1 + k[1])
-
-    t2 =  S2[byte(id)] xor S3[byte(id shr 8)] xor S4[byte(id shr 16)] xor S1[byte(id shr 24)]
-    t1 = (S1[byte(ic)] xor S2[byte(ic shr 8)] xor S3[byte(ic shr 16)] xor S4[byte(ic shr 24)]) + t2
-    ia = rotateRightBits(ia xor (t1 + k[2]), 1)
-    ib = rotateLeftBits(ib, 1) xor (t2 + t1 + k[3])
-
-  # NOTE: output with "undo last swap"
-  let
-    ta = ic xor c.k[4]
-    tb = id xor c.k[5]
-    tc = ia xor c.k[6]
-    td = ib xor c.k[7]
-
-  store32l(dst,  0, ta)
-  store32l(dst,  4, tb)
-  store32l(dst,  8, tc)
-  store32l(dst, 12, td)
+    result[7 - i] = byte((n shr (8 * i)) and 0xFF'u64)
 
 
-proc twofishDecrypt*(c: TwoFishCtx, src: openArray[byte], dst: var openArray[byte]) =
-  let
-    S1 = c.s[0]
-    S2 = c.s[1]
-    S3 = c.s[2]
-    S4 = c.s[3]
+proc hexDigest*(data: openArray[byte]): string =
+  ## produces a hex string of length data.len * 2
+  result = newStringOfCap(data.len + data.len)
+  for b in data:
+    result.add(b.toHex(2).toLowerAscii())
 
-  # NOTE: load input
-  var
-    ta = load32l(src[ 0 ..<  4])
-    tb = load32l(src[ 4 ..<  8])
-    tc = load32l(src[ 8 ..< 12])
-    td = load32l(src[12 ..< 16])
+  return result
 
-  # NOTE: undo final swap
-  var
-    ia = tc xor c.k[6]
-    ib = td xor c.k[7]
-    ic = ta xor c.k[4]
-    id = tb xor c.k[5]
 
-  var t1, t2: uint32
-  for i in countdown(8, 1, 1):
-    let k = c.k[4+i*4 ..< 8+i*4]
-    t2 =  S2[byte(id)] xor S3[byte(id shr 8)] xor S4[byte(id shr 16)] xor S1[byte(id shr 24)]
-    t1 = (S1[byte(ic)] xor S2[byte(ic shr 8)] xor S3[byte(ic shr 16)] xor S4[byte(ic shr 24)]) + t2
-    ia = rotateLeftBits(ia, 1) xor (t1 + k[2])
-    ib = rotateRightBits(ib xor (t2 + t1 + k[3]), 1)
+proc `$`*(data: seq[byte]): string =
+  return decodeBytes(data)
 
-    t2 =  S2[byte(ib)] xor S3[byte(ib shr 8)] xor S4[byte(ib shr 16)] xor S1[byte(ib shr 24)]
-    t1 = (S1[byte(ia)] xor S2[byte(ia shr 8)] xor S3[byte(ia shr 16)] xor S4[byte(ia shr 24)]) + t2
-    ic = rotateLeftBits(ic, 1) xor (t1 + k[0])
-    id = rotateRightBits(id xor (t2 + t1 + k[1]), 1)
+#################################################################################
+# ECB
+#################################################################################
 
-  # NOTE: undo pre-whitening
-  ia = ia xor c.k[0]
-  ib = ib xor c.k[1]
-  ic = ic xor c.k[2]
-  id = id xor c.k[3]
+proc encrypt*(ctx: TwofishEcbCtx, input: openArray[byte], output: var openArray[byte]) =
+  ## ECB Mode
+  ## encrypt in place
+  if input.len mod blocksize != 0:
+    raise newException(ValueError, "input length must be a multiple of 16")
+  if input.len > output.len:
+    raise newException(ValueError, "output length must be >= input length")
 
-  store32l(dst,  0, ia)
-  store32l(dst,  4, ib)
-  store32l(dst,  8, ic)
-  store32l(dst, 12, id)
+  var blk: array[blocksize, byte]
 
-###################################################################################
+  for i in countup(0, input.len - 1, step=blocksize):
+    twofishEncrypt(ctx.state, input[i ..< i + blocksize], blk)
+    for j, b in blk:
+      output[i + j] = b
 
-proc init*(key: openArray[byte], s: var array[4,  array[256, uint32]], k: var array[40, uint32]) =
-  ## initialize key and sboxes
-  let keylen = len(key)
 
-  if keylen != 16 and keylen != 24 and keylen != 32:
-    raise newException(KeySizeError, "Invalid key length")
+proc encrypt*(ctx: TwofishEcbCtx, input: openArray[byte]): seq[byte] =
+  ## ECB Mode
+  ## returns ciphertext as new sequence
+  if input.len mod blocksize != 0:
+    raise newException(ValueError, "input length must be a multiple of 16")
 
-  let kBits = keylen div 8
+  var blk: array[blocksize, byte]
+  result = newSeq[byte](input.len)
 
-  # NOTE: create the S[..] words
-  var S: array[4 * 4, byte]
-  for i in 0 ..< kBits:
-    for j, rsRow in rs:
-      for k, rsVal in rsRow:
-        S[4*i+j] = S[4*i+j] xor gfMult(key[8*i+k], rsVal, rsPolynomial)
-  
-  # NOTE: calculate subkeys
-  var A, B: uint32
-  var tmp: array[4, byte]
-  for i in 0 ..< 20:
-    for j in 0 ..< tmp.len:
-      tmp[j] = byte(2 * i)
-    A = h(tmp, key, 0)
+  for i in countup(0, input.len - 1, step=blocksize):
+    twofishEncrypt(ctx.state, input[i ..< i + blocksize], blk)
+    for j, b in blk:
+      result[i + j] = b
 
-    for j in 0 ..< tmp.len:
-      tmp[j] = byte(2*i + 1)
-    B = rotateLeftBits(h(tmp, key, 1), 8)
+  return result
 
-    k[2*i] = A + B
-    k[2*i+1] = rotateLeftBits(2*B+A, 9)
-  
-  # NOTE: calculate sboxes
-  case kBits:
-  of 2:
-    for i in 0 ..< 256:
-      s[0][i] = mdsColumnMult(sbox[1][sbox[0][sbox[0][i] xor S[0]] xor S[4]], 0)
-      s[1][i] = mdsColumnMult(sbox[0][sbox[0][sbox[1][i] xor S[1]] xor S[5]], 1)
-      s[2][i] = mdsColumnMult(sbox[1][sbox[1][sbox[0][i] xor S[2]] xor S[6]], 2)
-      s[3][i] = mdsColumnMult(sbox[0][sbox[1][sbox[1][i] xor S[3]] xor S[7]], 3)
-  of 3:
-    for i in 0 ..< 256:
-      s[0][i] = mdsColumnMult(sbox[1][sbox[0][sbox[0][sbox[1][i] xor S[0]] xor S[4]] xor S[ 8]], 0)
-      s[1][i] = mdsColumnMult(sbox[0][sbox[0][sbox[1][sbox[1][i] xor S[1]] xor S[5]] xor S[ 9]], 1)
-      s[2][i] = mdsColumnMult(sbox[1][sbox[1][sbox[0][sbox[0][i] xor S[2]] xor S[6]] xor S[10]], 2)
-      s[3][i] = mdsColumnMult(sbox[0][sbox[1][sbox[1][sbox[0][i] xor S[3]] xor S[7]] xor S[11]], 3)
+
+proc encrypt*(ctx: TwofishEcbCtx, input: string, output: var openArray[byte]) =
+  ## ECB Mode
+  ## encrypt in place
+  encrypt(ctx, input.encodeBytes(), output)
+
+
+proc encrypt*(ctx: TwofishEcbCtx, input: string): seq[byte] =
+  ## ECB Mode
+  ## returns ciphertext as new sequence
+  return encrypt(ctx, input.toOpenArrayByte(0, input.len.pred))
+
+
+proc decrypt*(ctx: TwofishEcbCtx, input: openArray[byte], output: var openArray[byte]) =
+  ## ECB Mode
+  ## decrypt in place
+  if input.len mod blocksize != 0:
+    raise newException(ValueError, "input length must be a multiple of 16")
+  if input.len > output.len:
+    raise newException(ValueError, "output length must be >= input length")
+
+  var blk: array[blocksize, byte]
+
+  for i in countup(0, input.len.pred, step=blocksize):
+    twofishDecrypt(ctx.state, input[i ..< i + blocksize], blk)
+    for j, b in blk:
+      output[i + j] = b
+
+
+proc decrypt*(ctx: TwofishEcbCtx, input: openArray[byte]): seq[byte] =
+  ## ECB Mode
+  ## returns ciphertext as new sequence
+  if input.len mod blocksize != 0:
+    raise newException(ValueError, "input length must be a multiple of 16")
+
+  var blk: array[blocksize, byte]
+  result = newSeq[byte](input.len)
+
+  for i in countup(0, input.len.pred, step=blocksize):
+    twofishDecrypt(ctx.state, input[i ..< i + blocksize], blk)
+    for j, b in blk:
+      result[i + j] = b
+
+  return result
+
+
+proc decrypt*(ctx: TwofishEcbCtx, input: string, output: var openArray[byte]) =
+  ## ECB Mode
+  ## decrypt in place
+  decrypt(ctx, input.encodeBytes(), output)
+
+
+proc decrypt*(ctx: TwofishEcbCtx, input: string): seq[byte] =
+  ## ECB Mode
+  ## returns ciphertext as new sequence
+  return decrypt(ctx, input.encodeBytes())
+
+#################################################################################
+# CBC
+#################################################################################
+
+proc encrypt*(ctx: var TwofishCbcCtx, input: openArray[byte], output: var openArray[byte]) =
+  ## CBC Mode
+  ## encrypt in place
+  if input.len mod blocksize != 0:
+    raise newException(ValueError, "input length must be a multiple of 16")
+  if input.len > output.len:
+    raise newException(ValueError, "output length must be >= input length")
+
+  var blk: array[blocksize, byte]
+
+  if not ctx.isEncryptState:
+    ctx.initPreviousBlock()
+    ctx.isEncryptState = true
+
+
+  for i in countup(0, input.high, step=blocksize):
+    # XOR with previous ciphertext block (or IV)
+    twofishEncrypt(ctx.state, xorBlocks(input[i ..< i + blocksize], ctx.previousBlock), blk)
+    for j, b in blk:
+      output[i + j] = b
+    ctx.previousBlock = blk
+
+
+proc encrypt*(ctx: var TwofishCbcCtx, input: openArray[byte]): seq[byte] =
+  ## CBC Mode
+  ## returns ciphertext as new sequence
+  if input.len mod blocksize != 0:
+    raise newException(ValueError, "input length must be a multiple of 16")
+
+  var blk: array[blocksize, byte]
+  result = newSeq[byte](input.len)
+
+  if not ctx.isEncryptState:
+    ctx.initPreviousBlock()
+    ctx.isEncryptState = true
+
+  for i in countup(0, input.high, step=blocksize):
+    # XOR with previous ciphertext block (or IV)
+    twofishEncrypt(ctx.state, xorBlocks(input[i ..< i + blocksize], ctx.previousBlock), blk)
+    for j, b in blk:
+      result[i + j] = b
+    ctx.previousBlock = blk
+
+  return result
+
+
+proc encrypt*(ctx: var TwofishCbcCtx, input: string, output: var openArray[byte]) =
+  ## CBC Mode
+  ## encrypt in place
+  encrypt(ctx, input.encodeBytes(), output)
+
+
+proc encrypt*(ctx: var TwofishCbcCtx, input: string): seq[byte] =
+  ## CBC Mode
+  ## returns ciphertext as new sequence
+  return encrypt(ctx, input.encodeBytes())
+
+
+proc decrypt*(ctx: var TwofishCbcCtx, input: openArray[byte], output: var openArray[byte]) =
+  ## CBC Mode
+  ## decrypt in place
+  if input.len mod blocksize != 0:
+    raise newException(ValueError, "input length must be a multiple of 16")
+  if input.len > output.len:
+    raise newException(ValueError, "output length must be >= input length")
+
+  var ptBlk: array[blocksize, byte]
+  var ctBlk: array[blocksize, byte]
+
+  if ctx.isEncryptState:
+    ctx.initPreviousBlock()
+    ctx.isEncryptState = false
+
+  for i in countup(0, input.high, step=blocksize):
+    for i, b in input[i ..< i + blocksize]:
+      ptBlk[i] = b
+    twofishDecrypt(ctx.state, ptBlk, ctBlk)
+    # XOR with previous ciphertext block (or IV for the first block)
+    xorBlocks(ctBlk, ctx.previousBlock)
+    for j, b in ctBlk:
+      output[i + j] = b
+    
+    ctx.previousBlock = ptBlk
+
+
+proc decrypt*(ctx: var TwofishCbcCtx, input: openArray[byte]): seq[byte] =
+  ## CBC Mode
+  ## returns ciphertext as new sequence
+  if input.len mod blocksize != 0:
+    raise newException(ValueError, "input length must be a multiple of 16")
+
+  var ptBlk: array[blocksize, byte]
+  var ctBlk: array[blocksize, byte]
+  result = newSeq[byte](input.len)
+
+  if ctx.isEncryptState:
+    ctx.initPreviousBlock()
+    ctx.isEncryptState = false
+
+  for i in countup(0, input.high, step=blocksize):
+    for i, b in input[i ..< i + blocksize]:
+      ptBlk[i] = b
+    twofishDecrypt(ctx.state, ptBlk, ctBlk)
+    # XOR with previous ciphertext block (or IV for the first block)
+    xorBlocks(ctBlk, ctx.previousBlock)
+    for j, b in ctBlk:
+      result[i + j] = b
+    ctx.previousBlock = ptBlk
+
+  return result
+
+
+proc decrypt*(ctx: var TwofishCbcCtx, input: string, output: var openArray[byte]) =
+  ## CBC Mode
+  ## decrypt in place
+  decrypt(ctx, input.encodeBytes(), output)
+
+
+proc decrypt*(ctx: var TwofishCbcCtx, input: string): seq[byte] =
+  ## CBC Mode
+  ## returns ciphertext as new sequence
+  return decrypt(ctx, input.encodeBytes())
+
+#################################################################################
+# CTR
+#################################################################################
+
+proc crypt*(ctx: var TwofishCtrCtx, input: openArray[byte], output: var openArray[byte]) =
+  ## CTR Mode
+  ## crypt in place
+  if input.len > output.len:
+    raise newException(ValueError, "output length must be >= input length")
+
+  var blk: array[blocksize, byte]
+
+  for i in countup(0, input.high, step=blocksize):
+    # Encrypt the counter
+    twofishEncrypt(ctx.state, ctx.counter, blk)
+    ctx.incrementCounter()
+    # XOR the encrypted counter with the block
+    for j, b in xorBlocksSeq(input[i ..< min(i + blocksize, input.len)], blk):
+      output[i + j] = b
+
+
+proc crypt*(ctx: var TwofishCtrCtx, input: openArray[byte]): seq[byte] =
+  ## CTR Mode
+  ## returns result as new sequence
+  var blk: array[blocksize, byte]
+  result = newSeq[byte](input.len)
+
+  for i in countup(0, input.high, step=blocksize):
+    # Encrypt the counter
+    twofishEncrypt(ctx.state, ctx.counter, blk)
+    ctx.incrementCounter()
+    # XOR the encrypted counter with the block
+    for j, b in xorBlocksSeq(input[i ..< min(i + blocksize, input.len)], blk):
+      result[i + j] = b
+
+  return result
+
+
+proc encrypt*(ctx: var TwofishCtrCtx, input: openArray[byte], output: var openArray[byte]) =
+  ## CTR Mode
+  ## encrypt in place
+  if not ctx.isEncryptState:
+    ctx.initCounter()
+    ctx.isEncryptState = true
+  crypt(ctx, input, output)
+
+
+proc encrypt*(ctx: var TwofishCtrCtx, input: openArray[byte]): seq[byte] =
+  ## CTR Mode
+  ## returns ciphertext as new sequence
+  if not ctx.isEncryptState:
+    ctx.initCounter()
+    ctx.isEncryptState = true
+  return crypt(ctx, input)
+
+
+proc encrypt*(ctx: var TwofishCtrCtx, input: string, output: var openArray[byte]) =
+  ## CTR Mode
+  ## encrypt in place
+  if not ctx.isEncryptState:
+    ctx.initCounter()
+    ctx.isEncryptState = true
+  crypt(ctx, input.encodeBytes(), output)
+
+
+proc encrypt*(ctx: var TwofishCtrCtx, input: string): seq[byte] =
+  ## CTR Mode
+  ## returns ciphertext as new sequence
+  if not ctx.isEncryptState:
+    ctx.initCounter()
+    ctx.isEncryptState = true
+  return crypt(ctx, input.encodeBytes())
+
+
+proc decrypt*(ctx: var TwofishCtrCtx, input: openArray[byte], output: var openArray[byte]) =
+  ## CTR Mode
+  ## decrypt in place
+  if ctx.isEncryptState:
+    ctx.initCounter()
+    ctx.isEncryptState = false
+  crypt(ctx, input, output)
+
+
+proc decrypt*(ctx: var TwofishCtrCtx, input: openArray[byte]): seq[byte] =
+  ## CTR Mode
+  ## returns ciphertext as new sequence
+  if ctx.isEncryptState:
+    ctx.initCounter()
+    ctx.isEncryptState = false
+  return crypt(ctx, input)
+
+
+proc decrypt*(ctx: var TwofishCtrCtx, input: string, output: var openArray[byte]) =
+  ## CTR Mode
+  ## decrypt in place
+  if ctx.isEncryptState:
+    ctx.initCounter()
+    ctx.isEncryptState = false
+  crypt(ctx, input.encodeBytes(), output)
+
+
+proc decrypt*(ctx: var TwofishCtrCtx, input: string): seq[byte] =
+  ## CTR Mode
+  ## returns ciphertext as new sequence
+  if ctx.isEncryptState:
+    ctx.initCounter()
+    ctx.isEncryptState = false
+  return crypt(ctx, input.encodeBytes())
+
+#################################################################################
+# GCM
+#################################################################################
+
+proc inc32(ctr: var Block128) {.inline.} =
+  ## increment low 32 bits of counter (big-endian)
+  var i = blocksize - 1
+  var carry = 1'u16
+  # bytes 12..15
+  while i >= blocksize - 4:
+    let sum = uint16(ctr[i]) + carry
+    ctr[i] = byte(sum and 0xFF)
+    carry = sum shr 8
+    if i == blocksize - 4: break
+    dec(i)
+
+
+proc gcmCalcH(state: TwoFishCtx): Block128 =
+  var zero: Block128
+  var outBlk: Block128
+  twofishEncrypt(state, zero, outBlk)
+  for i in 0 ..< blocksize: result[i] = outBlk[i]
+
+
+proc deriveJ0(H: Block128, iv: openArray[byte]): Block128 =
+  if iv.len == 12:
+    # IV || 0x00000001
+    for i in 0 ..< 12: result[i] = iv[i]
+    result[12] = 0x00
+    result[13] = 0x00
+    result[14] = 0x00
+    result[15] = 0x01
   else:
-    for i in 0 ..< 256:
-      s[0][i] = mdsColumnMult(sbox[1][sbox[0][sbox[0][sbox[1][sbox[1][i] xor S[0]] xor S[4]] xor S[ 8]] xor S[12]], 0)
-      s[1][i] = mdsColumnMult(sbox[0][sbox[0][sbox[1][sbox[1][sbox[0][i] xor S[1]] xor S[5]] xor S[ 9]] xor S[13]], 1)
-      s[2][i] = mdsColumnMult(sbox[1][sbox[1][sbox[0][sbox[0][sbox[0][i] xor S[2]] xor S[6]] xor S[10]] xor S[14]], 2)
-      s[3][i] = mdsColumnMult(sbox[0][sbox[1][sbox[1][sbox[0][sbox[1][i] xor S[3]] xor S[7]] xor S[11]] xor S[15]], 3)
+    # J0 = GHASH(H, empty, IV)
+    result = ghash(H, newSeq[byte](0), iv)
+
+
+proc gctr(state: TwoFishCtx, icb: Block128, input: openArray[byte], output: var openArray[byte]) =
+  var counter: Block128 = icb
+  var stream: Block128
+  var i = 0
+  while i < input.len:
+    inc32(counter)
+    twofishEncrypt(state, counter, stream)
+    let take = min(blocksize, input.len - i)
+    for j in 0 ..< take:
+      output[i + j] = input[i + j] xor stream[j]
+    i.inc(take)
+
+
+proc encrypt*(ctx: var TwofishGcmCtx, aad: openArray[byte], plaintext: openArray[byte], ciphertext: var openArray[byte], tag: var openArray[byte]) =
+  if plaintext.len > ciphertext.len:
+    raise newException(ValueError, "output length must be >= input length")
+  if tag.len != blocksize:
+    raise newException(ValueError, "tag must be 16 bytes long")
+  # C = GCTR(K, inc32(J0), P)
+  gctr(ctx.state, ctx.J0, plaintext, ciphertext)
+  # S = GHASH(H, A, C)
+  let S = ghash(ctx.H, aad, ciphertext)
+  # T = E(K, J0) xor S
+  var ekJ0: Block128
+  twofishEncrypt(ctx.state, ctx.J0, ekJ0)
+  for i in 0 ..< blocksize:
+    tag[i] = ekJ0[i] xor S[i]
+
+
+proc encrypt*(ctx: var TwofishGcmCtx, aad: openArray[byte], plaintext: openArray[byte]): (seq[byte], array[blocksize, byte]) =
+  var ct = newSeq[byte](plaintext.len)
+  var tag: array[blocksize, byte]
+  var tagBuf = newSeq[byte](blocksize)
+  encrypt(ctx, aad, plaintext, ct, tagBuf)
+  for i in 0 ..< blocksize: tag[i] = tagBuf[i]
+  return (ct, tag)
+
+
+proc decrypt*(ctx: var TwofishGcmCtx, aad: openArray[byte], ciphertext: openArray[byte], plaintext: var openArray[byte], tag: openArray[byte]) =
+  if ciphertext.len > plaintext.len:
+    raise newException(ValueError, "output length must be >= input length")
+  if tag.len != blocksize:
+    raise newException(ValueError, "tag must be 16 bytes long")
+  # Compute expected tag from ciphertext
+  let S = ghash(ctx.H, aad, ciphertext)
+  var ekJ0: Block128
+  twofishEncrypt(ctx.state, ctx.J0, ekJ0)
+  var expected = newSeq[byte](blocksize)
+  for i in 0 ..< blocksize:
+    expected[i] = ekJ0[i] xor S[i]
+  if not ctEq(expected, tag):
+    raise newException(ValueError, "GCM tag mismatch")
+  # P = GCTR(K, inc32(J0), C)
+  gctr(ctx.state, ctx.J0, ciphertext, plaintext)
+
+
+proc decrypt*(ctx: var TwofishGcmCtx, aad: openArray[byte], ciphertext: openArray[byte], tag: openArray[byte]): seq[byte] =
+  var pt = newSeq[byte](ciphertext.len)
+  decrypt(ctx, aad, ciphertext, pt, tag)
+  return pt
+
+#################################################################################
+# GCM-SIV
+#################################################################################
+
+proc deriveGcmSivKeys*(kgen: openArray[byte], nonce: openArray[byte]): (seq[byte], Block128) =
+  ## Returns (message_encryption_key, message_authentication_key)
+  if nonce.len != 12:
+    raise newException(ValueError, "Nonce must be 12 bytes long")
+  var st: TwoFishCtx
+  init(kgen, st.s, st.k)
+  var blk: array[blocksize, byte]
+  var blkOut: array[blocksize, byte]
+  var authKey: Block128
+  var encKey = newSeq[byte](if kgen.len == 32: 32 else: 16)
+
+  # Authentication key (16 bytes): counters 0,1
+  # counter 0
+  blk[0] = 0x00; blk[1] = 0x00; blk[2] = 0x00; blk[3] = 0x00
+  for i in 0 ..< 12: blk[4 + i] = nonce[i]
+  twofishEncrypt(st, blk, blkOut)
+  for i in 0 ..< 8: authKey[i] = blkOut[i]
+  # counter 1
+  blk[0] = 0x01; blk[1] = 0x00; blk[2] = 0x00; blk[3] = 0x00
+  for i in 0 ..< 12: blk[4 + i] = nonce[i]
+  twofishEncrypt(st, blk, blkOut)
+  for i in 0 ..< 8: authKey[8 + i] = blkOut[i]
+
+  # Encryption key: counters 2,3,(4,5)
+  blk[0] = 0x02; blk[1] = 0x00; blk[2] = 0x00; blk[3] = 0x00
+  for i in 0 ..< 12: blk[4 + i] = nonce[i]
+  twofishEncrypt(st, blk, blkOut)
+  for i in 0 ..< 8: encKey[i] = blkOut[i]
+  blk[0] = 0x03; blk[1] = 0x00; blk[2] = 0x00; blk[3] = 0x00
+  for i in 0 ..< 12: blk[4 + i] = nonce[i]
+  twofishEncrypt(st, blk, blkOut)
+  for i in 0 ..< 8: encKey[8 + i] = blkOut[i]
+  if kgen.len == 32:
+    blk[0] = 0x04; blk[1] = 0x00; blk[2] = 0x00; blk[3] = 0x00
+    for i in 0 ..< 12: blk[4 + i] = nonce[i]
+    twofishEncrypt(st, blk, blkOut)
+    for i in 0 ..< 8: encKey[16 + i] = blkOut[i]
+    blk[0] = 0x05; blk[1] = 0x00; blk[2] = 0x00; blk[3] = 0x00
+    for i in 0 ..< 12: blk[4 + i] = nonce[i]
+    twofishEncrypt(st, blk, blkOut)
+    for i in 0 ..< 8: encKey[24 + i] = blkOut[i]
+
+  return (encKey, authKey)
+
+
+proc inc32Le(ctr: var array[blocksize, byte]) {.inline.} =
+  var carry: uint16 = 1
+  for i in 0 ..< 4:
+    let s = uint16(ctr[i]) + carry
+    ctr[i] = byte(s and 0xFF)
+    carry = s shr 8
+
+
+proc gcmSivCtr(encState: TwoFishCtx, initial: array[blocksize, byte], input: openArray[byte], output: var openArray[byte]) =
+  var counter = initial
+  var stream: array[blocksize, byte]
+  var i = 0
+  while i < input.len:
+    # keystream = Twofish_K(counter)
+    twofishEncrypt(encState, counter, stream)
+    let take = min(blocksize, input.len - i)
+    for j in 0 ..< take:
+      output[i + j] = input[i + j] xor stream[j]
+    inc32Le(counter)
+    i.inc(take)
+
+
+proc encrypt*(ctx: TwofishGcmSivCtx, aad: openArray[byte], plaintext: openArray[byte], ciphertext: var openArray[byte], tag: var openArray[byte]) =
+  if plaintext.len > ciphertext.len:
+    raise newException(ValueError, "output length must be >= input length")
+  if tag.len != blocksize:
+    raise newException(ValueError, "tag must be 16 bytes long")
+  let (encKey, authKey) = deriveGcmSivKeys(ctx.key, ctx.nonce)
+  # Compute S_s via POLYVAL over padded AD || padded PT || lenblock(le)
+  let S = polyval(authKey, aad, plaintext)
+  var tagBlock: array[blocksize, byte]
+  for i in 0 ..< blocksize: tagBlock[i] = S[i]
+  for i in 0 ..< 12: tagBlock[i] = tagBlock[i] xor ctx.nonce[i]
+  tagBlock[15] = tagBlock[15] and 0x7F'u8
+  # Encrypt with encKey to get tag
+  var encState: TwoFishCtx
+  init(encKey, encState.s, encState.k)
+  var tagOut: array[blocksize, byte]
+  twofishEncrypt(encState, tagBlock, tagOut)
+  for i in 0 ..< blocksize: tag[i] = tagOut[i]
+  # CTR mode with initial counter = tag with MSB set
+  var ctr0 = tagOut
+  ctr0[15] = ctr0[15] or 0x80'u8
+  gcmSivCtr(encState, ctr0, plaintext, ciphertext)
+
+
+proc encrypt*(ctx: TwofishGcmSivCtx, aad: openArray[byte], plaintext: openArray[byte]): (seq[byte], array[blocksize, byte]) =
+  var ct = newSeq[byte](plaintext.len)
+  var tag: array[blocksize, byte]
+  var tagBuf = newSeq[byte](blocksize)
+  ctx.encrypt(aad, plaintext, ct, tagBuf)
+  for i in 0 ..< blocksize: tag[i] = tagBuf[i]
+  return (ct, tag)
+
+
+proc decrypt*(ctx: TwofishGcmSivCtx, aad: openArray[byte], ciphertext: openArray[byte], plaintext: var openArray[byte], tag: openArray[byte]) =
+  if ciphertext.len > plaintext.len:
+    raise newException(ValueError, "output length must be >= input length")
+  if tag.len != blocksize:
+    raise newException(ValueError, "tag must be 16 bytes long")
+  let (encKey, authKey) = deriveGcmSivKeys(ctx.key, ctx.nonce)
+  var encState: TwoFishCtx
+  init(encKey, encState.s, encState.k)
+  var ctr0: array[blocksize, byte]
+  for i in 0 ..< blocksize: ctr0[i] = tag[i]
+  ctr0[15] = ctr0[15] or 0x80'u8
+  gcmSivCtr(encState, ctr0, ciphertext, plaintext)
+  # Compute expected tag from AAD and plaintext
+  let S = polyval(authKey, aad, plaintext)
+  var tagBlock: array[blocksize, byte]
+  for i in 0 ..< blocksize: tagBlock[i] = S[i]
+  for i in 0 ..< 12: tagBlock[i] = tagBlock[i] xor ctx.nonce[i]
+  tagBlock[15] = tagBlock[15] and 0x7F'u8
+  var expected: array[blocksize, byte]
+  twofishEncrypt(encState, tagBlock, expected)
+  var expectedSeq = newSeq[byte](blocksize)
+  for i in 0 ..< blocksize: expectedSeq[i] = expected[i]
+  if not ctEq(expectedSeq, tag):
+    raise newException(ValueError, "GCM-SIV tag mismatch")
+
+
+proc decrypt*(ctx: TwofishGcmSivCtx, aad: openArray[byte], ciphertext: openArray[byte], tag: openArray[byte]): seq[byte] =
+  var pt = newSeq[byte](ciphertext.len)
+  ctx.decrypt(aad, ciphertext, pt, tag)
+  return pt
+
+#################################################################################
+# AEAD Convenience Wrappers (ct || tag)
+#################################################################################
+
+# GCM: returns ciphertext concatenated with 16-byte tag
+proc encryptAead*(ctx: var TwofishGcmCtx, aad: openArray[byte], plaintext: openArray[byte]): seq[byte] =
+  var ct = newSeq[byte](plaintext.len)
+  var tagBuf = newSeq[byte](blocksize)
+  ctx.encrypt(aad, plaintext, ct, tagBuf)
+  result = newSeq[byte](ct.len + blocksize)
+  for i in 0 ..< ct.len: result[i] = ct[i]
+  for j in 0 ..< blocksize: result[ct.len + j] = tagBuf[j]
+
+
+proc decryptAead*(ctx: var TwofishGcmCtx, aad: openArray[byte], data: openArray[byte]): seq[byte] =
+  if data.len < blocksize:
+    raise newException(ValueError, "aead input too short (no tag)")
+  let ctLen = data.len - blocksize
+  var pt = newSeq[byte](ctLen)
+  ctx.decrypt(aad, data[0 ..< ctLen], pt, data[ctLen ..< data.len])
+  return pt
+
+
+# GCM: string helpers (hex/base64)
+proc encryptAeadHex*(ctx: var TwofishGcmCtx, aad, plaintext: string): string =
+  let outBuf = ctx.encryptAead(aad.encodeBytes(), plaintext.encodeBytes())
+  return hexDigest(outBuf)
+
+
+proc decryptAeadHex*(ctx: var TwofishGcmCtx, aad: string, dataHex: string): string =
+  let data = fromHex(dataHex)
+  let pt = ctx.decryptAead(aad.encodeBytes(), data)
+  return decodeBytes(pt)
+
+
+proc encryptAeadB64*(ctx: var TwofishGcmCtx, aad, plaintext: string): string =
+  let outBuf = ctx.encryptAead(aad.encodeBytes(), plaintext.encodeBytes())
+  return encode(outBuf)
+
+
+proc decryptAeadB64*(ctx: var TwofishGcmCtx, aad: string, dataB64: string): string =
+  let raw = decode(dataB64)
+  let data = encodeBytes(raw)
+  let pt = ctx.decryptAead(aad.encodeBytes(), data)
+  return decodeBytes(pt)
+
+
+# GCM-SIV: returns ciphertext concatenated with 16-byte tag
+proc encryptAead*(ctx: TwofishGcmSivCtx, aad: openArray[byte], plaintext: openArray[byte]): seq[byte] =
+  var ct = newSeq[byte](plaintext.len)
+  var tagBuf = newSeq[byte](blocksize)
+  ctx.encrypt(aad, plaintext, ct, tagBuf)
+  result = newSeq[byte](ct.len + blocksize)
+  for i in 0 ..< ct.len: result[i] = ct[i]
+  for j in 0 ..< blocksize: result[ct.len + j] = tagBuf[j]
+
+
+proc decryptAead*(ctx: TwofishGcmSivCtx, aad: openArray[byte], data: openArray[byte]): seq[byte] =
+  if data.len < blocksize:
+    raise newException(ValueError, "aead input too short (no tag)")
+  let ctLen = data.len - blocksize
+  var pt = newSeq[byte](ctLen)
+  ctx.decrypt(aad, data[0 ..< ctLen], pt, data[ctLen ..< data.len])
+  return pt
+
+
+# GCM-SIV: string helpers (hex/base64)
+proc encryptAeadHex*(ctx: TwofishGcmSivCtx, aad, plaintext: string): string =
+  let outBuf = ctx.encryptAead(aad.encodeBytes(), plaintext.encodeBytes())
+  return hexDigest(outBuf)
+
+
+proc decryptAeadHex*(ctx: TwofishGcmSivCtx, aad: string, dataHex: string): string =
+  let data = fromHex(dataHex)
+  let pt = ctx.decryptAead(aad.encodeBytes(), data)
+  return decodeBytes(pt)
+
+#################################################################################
+# XTS
+#################################################################################
+
+proc xtsMulAlpha(t: var array[blocksize, byte]) {.inline.} =
+  ## Multiply tweak by alpha in GF(2^128) (little-endian byte order)
+  var carry: uint8 = 0
+  for i in 0 ..< blocksize:
+    let b = t[i]
+    let newCarry = (b shr 7) and 1
+    t[i] = ((b shl 1) and 0xFF) or carry
+    carry = newCarry
+  if carry == 1:
+    t[0] = t[0] xor 0x87'u8
+
+
+proc encrypt*(ctx: TwofishXtsCtx, tweak: openArray[byte], input: openArray[byte], output: var openArray[byte]) =
+  ## XTS encryption with ciphertext stealing for final partial block
+  if tweak.len != blocksize:
+    raise newException(ValueError, "XTS tweak must be 16 bytes")
+  if input.len < blocksize:
+    raise newException(ValueError, "XTS requires input length >= 16")
+  if output.len < input.len:
+    raise newException(ValueError, "output length must be >= input length")
+
+  var t: array[blocksize, byte]
+  for i in 0 ..< blocksize: t[i] = tweak[i]
+  twofishEncrypt(ctx.st2, t, t)
+  var t0: array[blocksize, byte]
+  for i in 0 ..< blocksize: t0[i] = t[i]
+
+  var off = 0
+  let nFull = input.len div blocksize
+  let r = input.len mod blocksize
+  var fullLen = if r == 0: nFull * blocksize else: (if nFull > 0: (nFull - 1) * blocksize else: 0)
+
+  var scratch: array[blocksize, byte]
+
+  while off < fullLen:
+    for i in 0 ..< blocksize: scratch[i] = input[off + i] xor t[i]
+    twofishEncrypt(ctx.st1, scratch, scratch)
+    for i in 0 ..< blocksize: output[off + i] = scratch[i] xor t[i]
+    xtsMulAlpha(t)
+    off += blocksize
+
+  if r == 0:
+    return
+
+  # Compute T_prev for last full block
+  let lastOff = (nFull - 1) * blocksize
+  let partOff = lastOff + blocksize
+  var tPrev: array[blocksize, byte]
+  for i in 0 ..< blocksize: tPrev[i] = t0[i]
+  for _ in 1 ..< nFull:
+    xtsMulAlpha(tPrev)
+  # Compute C* for last full block
+  for i in 0 ..< blocksize: scratch[i] = input[lastOff + i] xor tPrev[i]
+  twofishEncrypt(ctx.st1, scratch, scratch)
+  for i in 0 ..< blocksize: scratch[i] = scratch[i] xor tPrev[i]
+
+  # Write partial and replace head with P_partial
+  for i in 0 ..< r:
+    output[partOff + i] = scratch[i]
+    scratch[i] = input[partOff + i]
+
+  var tdash = t
+  xtsMulAlpha(tdash)
+  for i in 0 ..< blocksize: scratch[i] = scratch[i] xor tdash[i]
+  twofishEncrypt(ctx.st1, scratch, scratch)
+  for i in 0 ..< blocksize: output[lastOff + i] = scratch[i] xor tdash[i]
+
+
+proc decrypt*(ctx: TwofishXtsCtx, tweak: openArray[byte], input: openArray[byte], output: var openArray[byte]) =
+  ## XTS decryption with ciphertext stealing for final partial block
+  if tweak.len != blocksize:
+    raise newException(ValueError, "XTS tweak must be 16 bytes")
+  if input.len < blocksize:
+    raise newException(ValueError, "XTS requires input length >= 16")
+  if output.len < input.len:
+    raise newException(ValueError, "output length must be >= input length")
+
+  var t: array[blocksize, byte]
+  for i in 0 ..< blocksize: t[i] = tweak[i]
+  twofishEncrypt(ctx.st2, t, t)
+
+  let nFull = input.len div blocksize
+  let r = input.len mod blocksize
+  var fullLen = if r == 0: nFull * blocksize else: (if nFull > 0: (nFull - 1) * blocksize else: 0)
+
+  var off = 0
+  var scratch: array[blocksize, byte]
+
+  while off < fullLen:
+    for i in 0 ..< blocksize: scratch[i] = input[off + i] xor t[i]
+    twofishDecrypt(ctx.st1, scratch, scratch)
+    for i in 0 ..< blocksize: output[off + i] = scratch[i] xor t[i]
+    xtsMulAlpha(t)
+    off += blocksize
+
+  if r == 0:
+    return
+
+  let lastOffD = off
+  let partOffD = off + blocksize
+  var tdash = t
+  xtsMulAlpha(tdash)
+
+  # Pdash from C_{n-1} with tweak1
+  for i in 0 ..< blocksize: scratch[i] = input[lastOffD + i] xor tdash[i]
+  twofishDecrypt(ctx.st1, scratch, scratch)
+  for i in 0 ..< blocksize: scratch[i] = scratch[i] xor tdash[i]
+
+  # Write p_partial and set head to c_partial
+  for i in 0 ..< r:
+    output[partOffD + i] = scratch[i]
+    scratch[i] = input[partOffD + i]
+
+  for i in 0 ..< blocksize: scratch[i] = scratch[i] xor t[i]
+  twofishDecrypt(ctx.st1, scratch, scratch)
+  for i in 0 ..< blocksize: output[lastOffD + i] = scratch[i] xor t[i]
+
+
+proc encrypt*(ctx: TwofishXtsCtx, tweak: openArray[byte], input: openArray[byte]): seq[byte] =
+  result = newSeq[byte](input.len)
+  encrypt(ctx, tweak, input, result)
+
+
+proc decrypt*(ctx: TwofishXtsCtx, tweak: openArray[byte], input: openArray[byte]): seq[byte] =
+  result = newSeq[byte](input.len)
+  decrypt(ctx, tweak, input, result)
+
+
+proc encrypt*(ctx: TwofishXtsCtx, tweak, input: string): seq[byte] =
+  return encrypt(ctx, tweak.encodeBytes(), input.encodeBytes())
+
+
+proc decrypt*(ctx: TwofishXtsCtx, tweak, input: string): seq[byte] =
+  return decrypt(ctx, tweak.encodeBytes(), input.encodeBytes())
+
+
+# XTS: string helpers (hex/base64)
+proc encryptXtsHex*(ctx: TwofishXtsCtx, tweakHex, plaintextHex: string): string =
+  let tweak = fromHex(tweakHex)
+  let pt = fromHex(plaintextHex)
+  let ct = ctx.encrypt(tweak, pt)
+  return hexDigest(ct)
+
+
+proc decryptXtsHex*(ctx: TwofishXtsCtx, tweakHex, dataHex: string): string =
+  let tweak = fromHex(tweakHex)
+  let ct = fromHex(dataHex)
+  let pt = ctx.decrypt(tweak, ct)
+  return hexDigest(pt)
+
+
+proc encryptXtsB64*(ctx: TwofishXtsCtx, tweakB64, plaintextB64: string): string =
+  let tweakRaw = decode(tweakB64)
+  let dataRaw = decode(plaintextB64)
+  let ct = ctx.encrypt(encodeBytes(tweakRaw), encodeBytes(dataRaw))
+  return encode(ct)
+
+
+proc decryptXtsB64*(ctx: TwofishXtsCtx, tweakB64, dataB64: string): string =
+  let tweakRaw = decode(tweakB64)
+  let dataRaw = decode(dataB64)
+  let pt = ctx.decrypt(encodeBytes(tweakRaw), encodeBytes(dataRaw))
+  return encode(pt)
+
+
+proc encryptAeadB64*(ctx: TwofishGcmSivCtx, aad, plaintext: string): string =
+  let outBuf = ctx.encryptAead(aad.encodeBytes(), plaintext.encodeBytes())
+  return encode(outBuf)
+
+
+proc decryptAeadB64*(ctx: TwofishGcmSivCtx, aad: string, dataB64: string): string =
+  let raw = decode(dataB64)
+  let data = encodeBytes(raw)
+  let pt = ctx.decryptAead(aad.encodeBytes(), data)
+  return decodeBytes(pt)
+
+#################################################################################
+# initializers
+#################################################################################
+
+proc newTwofishEcbCtx*(key: openArray[byte]): TwofishEcbCtx =
+  if not key.len in {16, 24, 32}:
+    raise newException(ValueError, "Key must be 16/24/32 bytes long")
+  result.key = toSeq(key)
+  init(result.key, result.state.s, result.state.k)
+
+
+proc newTwofishEcbCtx*(key: string): TwofishEcbCtx =
+  return newTwofishEcbCtx(key.encodeBytes())
+
+
+proc newTwofishCbcCtx*(key, iv: openArray[byte]): TwofishCbcCtx =
+  if not key.len in {16, 24, 32}:
+    raise newException(ValueError, "Key must be 16/24/32 bytes long")
+  if iv.len != 16:
+    raise newException(ValueError, "Initialization vector (IV) must be 16 bytes long")
+  result.key = toSeq(key)
+  result.iv = toSeq(iv)
+  result.initPreviousBlock()
+
+  init(result.key, result.state.s, result.state.k)
+
+
+proc newTwofishCbcCtx*(key, iv: string): TwofishCbcCtx =
+  return newTwofishCbcCtx(key.encodeBytes(), iv.encodeBytes())
+
+
+proc newTwofishCtrCtx*(key, nonce: openArray[byte], initState: openArray[byte]=newSeq[byte](8)): TwofishCtrCtx =
+  if not key.len in {16, 24, 32}:
+    raise newException(ValueError, "Key must be 16/24/32 bytes long")
+  if nonce.len != 8:
+    raise newException(ValueError, "Nonce must be 8 bytes long")
+  if initState.len != 8:
+    raise newException(ValueError, "Initial state must be 8 bytes long")
+  
+  result.key = toSeq(key)
+  result.nonce = toSeq(nonce)
+  for i, b in initState:
+    result.initState[i] = b
+  result.initCounter()
+
+  init(result.key, result.state.s, result.state.k)
+
+
+proc newTwofishCtrCtx*(key, nonce: string, initState: int = 0): TwofishCtrCtx =
+  return newTwofishCtrCtx(key.encodeBytes(), nonce.encodeBytes(), intToBytesBE(uint64(initState)))
+
+
+proc newTwofishGcmCtx*(key, iv: openArray[byte]): TwofishGcmCtx =
+  if not key.len in {16, 24, 32}:
+    raise newException(ValueError, "Key must be 16/24/32 bytes long")
+  if iv.len == 0:
+    raise newException(ValueError, "IV must be non-empty")
+  result.key = toSeq(key)
+  result.iv = toSeq(iv)
+  init(result.key, result.state.s, result.state.k)
+  result.H = gcmCalcH(result.state)
+  result.J0 = deriveJ0(result.H, result.iv)
+
+
+proc newTwofishGcmCtx*(key, iv: string): TwofishGcmCtx =
+  return newTwofishGcmCtx(key.encodeBytes(), iv.encodeBytes())
+
+
+proc newTwofishGcmSivCtx*(key, nonce: openArray[byte]): TwofishGcmSivCtx =
+  if not key.len in {16, 32}:
+    raise newException(ValueError, "Key must be 16 or 32 bytes long for GCM-SIV")
+  if nonce.len != 12:
+    raise newException(ValueError, "Nonce must be 12 bytes long")
+  result.key = toSeq(key)
+  result.nonce = toSeq(nonce)
+
+
+proc newTwofishGcmSivCtx*(key, nonce: string): TwofishGcmSivCtx =
+  return newTwofishGcmSivCtx(key.encodeBytes(), nonce.encodeBytes())
+
+
+proc newTwofishXtsCtx*(key1, key2: openArray[byte]): TwofishXtsCtx =
+  if not (key1.len == 16 or key1.len == 32) or key2.len != key1.len:
+    raise newException(ValueError, "XTS keys must be 16/16 or 32/32 bytes long")
+  result.key1 = toSeq(key1)
+  result.key2 = toSeq(key2)
+  init(result.key1, result.st1.s, result.st1.k)
+  init(result.key2, result.st2.s, result.st2.k)
+
+
+proc newTwofishXtsCtx*(combined: openArray[byte]): TwofishXtsCtx =
+  if not (combined.len == 32 or combined.len == 64):
+    raise newException(ValueError, "XTS combined key must be 32 or 64 bytes")
+  let half = combined.len div 2
+  return newTwofishXtsCtx(combined[0 ..< half], combined[half ..< combined.len])
+
+
+proc newTwofishXtsCtx*(key1, key2: string): TwofishXtsCtx =
+  return newTwofishXtsCtx(key1.encodeBytes(), key2.encodeBytes())
+
+
+proc newTwofishXtsCtx*(combined: string): TwofishXtsCtx =
+  return newTwofishXtsCtx(combined.encodeBytes())
+
+#################################################################################
+
+when isMainModule:
+  let
+    message = "This is a message of length 32!!" # 32
+    key = "0123456789ABCDEFGHIJKLMNOPQRSTUV" # 32
+    iv = "0000000000000000" # 16
+
+  var ctx = newTwofishCbcCtx(key, iv)
+  let ciphertext = ctx.encrypt(message)
+  echo encode(ciphertext)
+  let plaintext = ctx.decrypt(ciphertext)
+  echo plaintext
+  doAssert $plaintext == message
